@@ -147,7 +147,7 @@ def enum_windows_for_pids(target_pids) -> int:
 def focus_existing_instance() -> bool:
     """尝试激活已运行的窗口（通过标题或PID枚举）。"""
     # 先通过固定标题尝试定位
-    if focus_existing_instance_by_title("FuckTencentACE  github@moyuanzheng"):
+    if focus_existing_instance_by_title("FuckTencentACE  github@https://github.com/MoYuanzheng/FuckTencentACE"):
         return True
 
     # 通过进程名/命令行匹配，枚举窗口
