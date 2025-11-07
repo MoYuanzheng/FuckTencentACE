@@ -107,23 +107,5 @@ build.bat
 
 ---
 
-### 目录结构（节选）
-
-```
-ACE/
-  ├─ FuckTencentACE.py        # 应用入口（Tk GUI + 托盘 + 监控逻辑）
-  ├─ build.bat                # 一键打包脚本（PyInstaller）
-  ├─ requirements.txt         # 运行依赖：psutil、pillow、pystray
-  ├─ logo.ico                 # 程序图标（可选）
-  ├─ CounterACE_logo.png      # 托盘图标备用（可选）
-  └─ dist/
-       ├─ FuckTencentACE.exe  # 打包产物（主程序）
-       └─ FuckTencentACE.pkg  # 某些版本需要的附属包（如有）
-```
-
----
-
-### 免责声明
-本工具仅用于学习与研究用途。使用本工具所产生的一切后果由使用者自行承担。请遵守相关法律法规与目标软件的使用条款。
 
 
