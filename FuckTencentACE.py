@@ -5,8 +5,10 @@ import ctypes
 import ctypes.wintypes as wintypes
 import threading
 import os
+import socket
 from pathlib import Path
 from tkinter import Tk, Text, Scrollbar, Frame, Button, Label, END, DISABLED, NORMAL
+import winreg
 from tkinter import font as tkfont
 from typing import List
 from PIL import Image
@@ -18,9 +20,19 @@ TARGET_PROCESSES = ["SGuard64.exe", "SGuardSvc64.exe"]
 CHECK_INTERVAL = 180  # 检查间隔（秒）
 FIRST_DELAY = 180  # 首次检测延迟（秒）
 TARGET_CPU = None  # 目标CPU核心（None自动选择最后一个）
+IPC_PORT = 47639  # 本地进程间通信端口
+IPC_TOKEN = b"FTACE_SHOW"  # 简单令牌
 
 # 单实例互斥量句柄（保持引用以防被GC释放）
 SINGLE_INSTANCE_HANDLE = None
+
+# 应用信息
+APP_NAME = "FuckTencentACE"
+APP_VERSION = "1.0"
+
+
+def get_app_title() -> str:
+    return f"{APP_NAME} {APP_VERSION} github@https://github.com/MoYuanzheng/FuckTencentACE"
 
 # 获取资源文件路径（支持打包后的路径）
 
@@ -146,8 +158,12 @@ def enum_windows_for_pids(target_pids) -> int:
 
 def focus_existing_instance() -> bool:
     """尝试激活已运行的窗口（通过标题或PID枚举）。"""
+    # 优先通过本地IPC请求已运行实例主动显示窗口
+    if notify_existing_instance_show():
+        return True
+
     # 先通过固定标题尝试定位
-    if focus_existing_instance_by_title("FuckTencentACE  github@https://github.com/MoYuanzheng/FuckTencentACE"):
+    if focus_existing_instance_by_title(get_app_title()):
         return True
 
     # 通过进程名/命令行匹配，枚举窗口
@@ -158,13 +174,13 @@ def focus_existing_instance() -> bool:
             cmdline_list = proc.info.get('cmdline') or []
             cmdline = ' '.join(cmdline_list).lower()
 
-            # 打包后可能为 fuckace.exe 或 fucktencentace.exe
-            if name in ("fuckace.exe", "fucktencentace.exe", "fuckace"):
+            # 打包后进程名可能包含版本等后缀，放宽为包含关键字
+            if any(token in name for token in ("fucktencentace", "fuckace")):
                 candidate_pids.add(proc.info['pid'])
                 continue
 
-            # 源码运行：python* + FuckACE.py
-            if ("python" in name) and ("fuckace.py" in cmdline):
+            # 源码运行：python* + FuckTencentACE.py（兼容历史名 fuckace.py）
+            if ("python" in name) and ("fucktencentace.py" in cmdline or "fuckace.py" in cmdline):
                 candidate_pids.add(proc.info['pid'])
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
@@ -176,6 +192,16 @@ def focus_existing_instance() -> bool:
     if hwnd:
         return show_and_focus_window(hwnd)
     return False
+
+
+def notify_existing_instance_show(timeout_sec: float = 0.3) -> bool:
+    """尝试通过本地回环端口通知已运行实例显示窗口。"""
+    try:
+        with socket.create_connection(("127.0.0.1", IPC_PORT), timeout=timeout_sec) as s:
+            s.sendall(IPC_TOKEN)
+            return True
+    except Exception:
+        return False
 
 
 def acquire_single_instance_mutex(name: str) -> bool:
@@ -204,9 +230,9 @@ def acquire_single_instance_mutex(name: str) -> bool:
 
 
 class ProcessMonitorGUI:
-    def __init__(self, root):
+    def __init__(self, root, start_silent: bool = False):
         self.root = root
-        self.root.title("FuckTencentACE  github@moyuanzheng")
+        self.root.title(get_app_title())
         # 设置窗口为当前屏幕宽高的一半，并居中显示
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
@@ -233,6 +259,9 @@ class ProcessMonitorGUI:
         self.first_detection = True
         self.tray_icon = None
         self.is_hidden = False
+        self.start_silent = start_silent
+        self.ipc_running = False
+        self._ipc_sock = None
 
         # 拦截窗口关闭事件
         self.root.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
@@ -243,10 +272,17 @@ class ProcessMonitorGUI:
         # 创建系统托盘图标
         self.create_tray_icon()
 
+        # 启动本地IPC服务，用于唤醒窗口
+        self.start_ipc_server()
+
         # 启动监控线程
         self.monitor_thread = threading.Thread(
             target=self.monitor_processes, daemon=True)
         self.monitor_thread.start()
+
+        # 根据配置静默启动（最小化到托盘，不弹窗）
+        if self.start_silent:
+            self.minimize_to_tray(silent=True)
 
     def create_widgets(self):
         # 顶部标签
@@ -271,25 +307,70 @@ class ProcessMonitorGUI:
         scrollbar.pack(side="right", fill="y")
         self.log_text.config(yscrollcommand=scrollbar.set)
 
-        # 状态条
-        self.status_var = Label(
-            self.root, text="就绪 - 等待监控开始", bd=1, relief="sunken", anchor="w")
-        self.status_var.pack(side="bottom", fill="x")
+        # 状态条（左侧三项状态 + 右侧消息）
+        status_frame = Frame(self.root, bd=1, relief="sunken")
+        status_frame.pack(side="bottom", fill="x")
+
+        # 左侧状态项
+        self.mon_status_label = Label(
+            status_frame, text="", anchor="w", padx=8)
+        self.mon_status_label.pack(side="left")
+        self.autostart_status_label = Label(
+            status_frame, text="", anchor="w", padx=8)
+        self.autostart_status_label.pack(side="left")
+        self.silent_status_label = Label(
+            status_frame, text="", anchor="w", padx=8)
+        self.silent_status_label.pack(side="left")
+
+        # 右侧消息区
+        self.status_var = Label(status_frame, text="就绪 - 等待监控开始", anchor="w")
+        self.status_var.pack(side="right", fill="x", expand=True)
 
         # 控制按钮
         btn_frame = Frame(self.root)
         btn_frame.pack(pady=10)
 
+        # 统一按钮样式
+        common_kwargs = {
+            'font': self.font,
+            'width': 16,
+            'relief': 'ridge',
+            'bd': 1,
+            'activebackground': '#2d2d2d',
+            'activeforeground': 'white',
+            'cursor': 'hand2'
+        }
+
         self.stop_btn = Button(
             btn_frame,
-            text="停止监控",
+            text="停止并退出",
             command=self.stop_monitoring,
-            font=self.font,
-            width=15,
             bg="#ff4444",
-            fg="white"
+            fg="white",
+            **common_kwargs
         )
-        self.stop_btn.pack()
+        self.stop_btn.grid(row=0, column=0, padx=6, pady=2)
+
+        # 开机自启按钮
+        self.autostart_btn = Button(
+            btn_frame,
+            text="",
+            command=self.toggle_autostart,
+            **common_kwargs
+        )
+        self.autostart_btn.grid(row=0, column=1, padx=6, pady=2)
+        self.refresh_autostart_btn()
+
+        # 静默启动按钮
+        self.silent_btn = Button(
+            btn_frame,
+            text="",
+            command=self.toggle_silent_start,
+            **common_kwargs
+        )
+        self.silent_btn.grid(row=0, column=2, padx=6, pady=2)
+        self.refresh_silent_btn()
+        self.update_status_indicators()
 
     def add_log(self, message, is_success=True):
         """添加日志到文本区域"""
@@ -303,6 +384,18 @@ class ProcessMonitorGUI:
 
         # 更新状态条
         self.status_var.config(text=message)
+
+    def update_status_indicators(self):
+        """刷新底部三项状态文本"""
+        try:
+            mon_text = f"监控状态：{'监控中' if self.running else '已停止'}"
+            autostart_text = f"开机自启：{'开启' if is_autostart_enabled() else '关闭'}"
+            silent_text = f"静默启动：{'开启' if is_silent_start_enabled() else '关闭'}"
+            self.mon_status_label.config(text=mon_text)
+            self.autostart_status_label.config(text=autostart_text)
+            self.silent_status_label.config(text=silent_text)
+        except Exception:
+            pass
 
     def get_target_priority(self):
         """获取目标优先级"""
@@ -426,11 +519,15 @@ class ProcessMonitorGUI:
         self.running = False
         self.add_log("正在停止监控...")
         self.status_var.config(text="已停止监控，即将退出")
+        self.update_status_indicators()
         self.stop_btn.config(state=DISABLED, text="退出中...")
 
         # 停止托盘图标
         if self.tray_icon:
             self.tray_icon.stop()
+
+        # 停止IPC服务
+        self.stop_ipc_server()
 
         # 延迟关闭，确保线程结束
         self.root.after(2000, self.root.destroy)
@@ -465,11 +562,12 @@ class ProcessMonitorGUI:
         except Exception as e:
             print(f"创建托盘图标失败: {e}")
 
-    def minimize_to_tray(self):
+    def minimize_to_tray(self, *args, silent: bool = False):
         """最小化到系统托盘"""
         self.root.withdraw()
         self.is_hidden = True
-        self.add_log("程序已最小化到系统托盘")
+        if not silent:
+            self.add_log("程序已最小化到系统托盘")
 
     def show_window(self):
         """从托盘显示窗口"""
@@ -478,9 +576,115 @@ class ProcessMonitorGUI:
         self.root.focus_force()
         self.is_hidden = False
 
+    def start_ipc_server(self):
+        """启动本地回环TCP服务，接收显示窗口指令"""
+        if self.ipc_running:
+            return
+        self.ipc_running = True
+
+        def loop():
+            try:
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("127.0.0.1", IPC_PORT))
+                srv.listen(5)
+                srv.settimeout(1.0)
+                self._ipc_sock = srv
+                while self.ipc_running:
+                    try:
+                        conn, _ = srv.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    with conn:
+                        try:
+                            data = conn.recv(32)
+                            if data == IPC_TOKEN:
+                                # 切回主线程执行UI操作
+                                self.root.after(0, self.show_window)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    def stop_ipc_server(self):
+        """停止本地回环TCP服务"""
+        self.ipc_running = False
+        try:
+            if self._ipc_sock:
+                try:
+                    self._ipc_sock.close()
+                finally:
+                    self._ipc_sock = None
+        except Exception:
+            pass
+
     def quit_app(self):
         """退出应用程序"""
         self.stop_monitoring()
+
+    def refresh_autostart_btn(self):
+        enabled = is_autostart_enabled()
+        if enabled:
+            # 显示下一步动作：关闭
+            self.autostart_btn.config(
+                text="关闭开机自启", bg="#ff4444", fg="white")
+        else:
+            # 显示下一步动作：开启
+            self.autostart_btn.config(
+                text="开启开机自启", bg="#448aff", fg="white")
+
+    def toggle_autostart(self):
+        try:
+            target_state = not is_autostart_enabled()
+            if set_autostart_enabled(target_state):
+                if target_state:
+                    self.add_log("已启用开机自启（当前用户）")
+                else:
+                    self.add_log("已关闭开机自启（当前用户）")
+            else:
+                self.add_log("操作开机自启失败，请检查权限或注册表访问", False)
+        except Exception as e:
+            self.add_log(f"设置开机自启出错: {e}", False)
+        finally:
+            self.refresh_autostart_btn()
+            self.update_status_indicators()
+
+    def refresh_silent_btn(self):
+        enabled = is_silent_start_enabled()
+        if enabled:
+            # 显示下一步动作：关闭
+            self.silent_btn.config(
+                text="关闭静默启动", bg="#ff4444", fg="white")
+        else:
+            # 显示下一步动作：开启
+            self.silent_btn.config(
+                text="开启静默启动", bg="#7c4dff", fg="white")
+
+    def toggle_silent_start(self):
+        try:
+            target_state = not is_silent_start_enabled()
+            if set_silent_start_enabled(target_state):
+                if target_state:
+                    self.add_log("已启用静默启动（仅对开机自启生效）")
+                else:
+                    self.add_log("已关闭静默启动")
+            else:
+                self.add_log("操作静默启动失败，请检查权限或注册表访问", False)
+        except Exception as e:
+            self.add_log(f"设置静默启动出错: {e}", False)
+        finally:
+            # 若开机自启已启用，更新注册表 Run 的命令以同步 --silent 参数
+            try:
+                if is_autostart_enabled():
+                    set_autostart_enabled(True)
+            except Exception:
+                pass
+            self.refresh_silent_btn()
+            self.update_status_indicators()
 
 
 def is_admin():
@@ -491,14 +695,113 @@ def is_admin():
         return False
 
 
+# =====================
+# 开机自启（注册表 Run）
+# =====================
+
+def _get_autostart_reg_path() -> str:
+    return r"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+
+
+def _get_autostart_value_name() -> str:
+    return "FuckTencentACE"
+
+
+def get_autostart_command() -> str:
+    """返回写入注册表的启动命令；根据静默偏好决定是否添加 --silent 参数。"""
+    try:
+        silent_flag = " --silent" if is_silent_start_enabled() else ""
+        if getattr(sys, 'frozen', False):
+            # PyInstaller 打包后的可执行文件
+            return f'"{sys.executable}"{silent_flag}'
+        # 源码运行：python 可执行路径 + 脚本路径
+        python = sys.executable
+        script = os.path.abspath(__file__)
+        return f'"{python}" "{script}"{silent_flag}'
+    except Exception:
+        return sys.executable
+
+
+def is_autostart_enabled() -> bool:
+    if not psutil.WINDOWS:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _get_autostart_reg_path(), 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, _get_autostart_value_name())
+            cmd = get_autostart_command()
+            # 仅当值完全匹配我们期望的启动命令时认为开启
+            return isinstance(val, str) and val.strip() == cmd
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def set_autostart_enabled(enable: bool) -> bool:
+    if not psutil.WINDOWS:
+        return False
+    try:
+        if enable:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _get_autostart_reg_path()) as key:
+                winreg.SetValueEx(key, _get_autostart_value_name(
+                ), 0, winreg.REG_SZ, get_autostart_command())
+            return True
+        # 关闭
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _get_autostart_reg_path(), 0, winreg.KEY_SET_VALUE) as key:
+            try:
+                winreg.DeleteValue(key, _get_autostart_value_name())
+            except FileNotFoundError:
+                pass
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        return False
+
+
+# =====================
+# 应用设置（注册表 自定义项）
+# =====================
+
+def _get_settings_reg_path() -> str:
+    return r"Software\\FuckTencentACE"
+
+
+def is_silent_start_enabled() -> bool:
+    if not psutil.WINDOWS:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _get_settings_reg_path(), 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, "SilentStart")
+            return int(val) == 1
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def set_silent_start_enabled(enable: bool) -> bool:
+    if not psutil.WINDOWS:
+        return False
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _get_settings_reg_path()) as key:
+            winreg.SetValueEx(key, "SilentStart", 0,
+                              winreg.REG_DWORD, 1 if enable else 0)
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        return False
+
+
 if __name__ == "__main__":
     # 启用高DPI感知，避免4K/高分屏模糊
     enable_high_dpi_awareness()
 
-    # 若已有实例在运行：直接激活并退出
+    # 若已有实例在运行：优先通过IPC请求显示窗口；否则尝试聚焦并退出
     if psutil.WINDOWS:
         try:
-            if focus_existing_instance():
+            if notify_existing_instance_show() or focus_existing_instance():
                 sys.exit(0)
         except Exception:
             pass
@@ -506,8 +809,12 @@ if __name__ == "__main__":
     # 单实例互斥量：确保仅一个实例运行
     if psutil.WINDOWS:
         if not acquire_single_instance_mutex(r"Local\\FuckTencentACE_SingleInstance"):
-            # 已存在实例，尽力激活其窗口
-            focus_existing_instance()
+            # 已存在实例，先发IPC指令再尽力激活其窗口
+            try:
+                if not notify_existing_instance_show():
+                    focus_existing_instance()
+            except Exception:
+                pass
             sys.exit(0)
 
     # 检查管理员权限
@@ -528,5 +835,7 @@ if __name__ == "__main__":
     set_tk_dpi_scaling(root)
     # 确保中文显示正常
     root.option_add("*Font", "{Microsoft YaHei} 10")
-    app = ProcessMonitorGUI(root)
+    # 仅当命令行包含 --silent 时，才静默启动（避免影响手动启动）
+    argv_lower = [arg.lower() for arg in sys.argv[1:]]
+    app = ProcessMonitorGUI(root, start_silent=("--silent" in argv_lower))
     root.mainloop()
